@@ -40,6 +40,7 @@
 #include <rte_string_fns.h>
 
 #include "main.h"
+#include "onnx_inference.h"
 
 static const char usage[] = "\n";
 

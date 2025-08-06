@@ -41,6 +41,7 @@
 #include <rte_lpm6.h>
 
 #include "main.h"
+#include "onnx_inference.h"
 
 bool force_quit;
 
@@ -100,6 +101,9 @@ main(int argc, char **argv)
 		rte_eth_dev_close(port);
 		printf("Done\n");
 	}
+
+	/* Clean up ONNX Runtime */
+    onnx_cleanup();
 
 	/* Clean up the EAL */
 	rte_eal_cleanup();

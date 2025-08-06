@@ -19,13 +19,16 @@
 #include <rte_memory.h>
 #include <rte_memcpy.h>
 #include <rte_eal.h>
+#include <rte_malloc.h>
 #include <rte_per_lcore.h>
 #include <rte_launch.h>
 #include <rte_cycles.h>
 #include <rte_mldev.h>
+#include <rte_hash.h>
 #include <rte_prefetch.h>
 #include <rte_lcore.h>
 #include <rte_branch_prediction.h>
+#include <rte_bus_vdev.h>
 #include <rte_interrupts.h>
 #include <rte_pci.h>
 #include <rte_random.h>
@@ -41,7 +44,9 @@
 #include <rte_lpm.h>
 #include <rte_lpm6.h>
 
+
 #include "main.h"
+#include "onnx_inference.h"
 
 struct app_params app = {
 	/* Ports*/
@@ -50,8 +55,8 @@ struct app_params app = {
 	.port_tx_ring_size = 512,
 
 	/* Rings */
-	.ring_rx_size = 128,
-	.ring_tx_size = 128,
+	.ring_rx_size = 4096,
+	.ring_tx_size = 4096,
 
 	/* Buffer pool */
 	.pool_buffer_size = 2048 + RTE_PKTMBUF_HEADROOM,
@@ -70,6 +75,19 @@ struct app_params app = {
 
 
 struct rte_ring *ml_ring;
+struct rte_hash      *flow_ht   = NULL;
+struct flow_ctx     **flow_pool = NULL;
+struct rte_mempool   *ctx_mp    = NULL;
+
+struct rte_ring      *quar_ring = NULL;
+struct rte_mempool   *vec_mp    = NULL;
+
+/* shared handles for pipeline / ML worker */
+struct rte_pipeline  *pipeline_core1 = NULL;
+void                 *class_tbl_core1 = NULL;
+uint32_t              class_table_id  = 0;
+uint32_t              good_port_id    = 0; 
+
 
 static struct rte_eth_conf port_conf = {
 	.rxmode = {
@@ -159,7 +177,7 @@ static void
 app_init_ml_ring(void) {
     ml_ring = rte_ring_create
 	("ML_RING", 
-		128, 
+		4096,  // Size of the ML ring
 		rte_socket_id(), 
 		RING_F_SP_ENQ | RING_F_SC_DEQ);  //single-producer, single-consumer(lockless rings)
 
@@ -167,93 +185,6 @@ app_init_ml_ring(void) {
         rte_panic("Cannot create ML ring\n");
 }
 
-static void
-app_init_ml_model(uint16_t ml_dev_id)
-{
-    struct rte_ml_model_params model_params = {
-        .model_id = MODEL_ID,
-        .version = 1,
-        .size = 0,  // Will be set after reading file
-        .path = MODEL_PATH,
-        .input_size = INPUT_SIZE,
-        .output_size = OUTPUT_SIZE,
-        .flags = 0
-    };
-
-    // Read model file
-    FILE *f = fopen(MODEL_PATH, "rb");
-    if (f == NULL)
-        rte_exit(EXIT_FAILURE, "Failed to open model file\n");
-
-    // Get file size
-    fseek(f, 0, SEEK_END);
-    model_params.size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    // Allocate buffer for model
-    void *model_data = rte_malloc("ml_model", model_params.size, 0);
-    if (model_data == NULL)
-        rte_exit(EXIT_FAILURE, "Failed to allocate model buffer\n");
-
-    // Read model into buffer
-    if (fread(model_data, 1, model_params.size, f) != model_params.size)
-        rte_exit(EXIT_FAILURE, "Failed to read model file\n");
-    fclose(f);
-
-    // Load model for driver resorces
-    if (rte_ml_model_load(ml_dev_id, &model_params) < 0)
-        rte_exit(EXIT_FAILURE, "Failed to load ML model\n");
-
-    rte_free(model_data);
-}
-
-static void 
-app_init_ml_device(void)
-{
-    uint16_t ml_dev_id;
-    struct rte_ml_dev_info dev_info;
-    struct rte_ml_dev_config dev_config;
-    
-    // Find ML device
-    ml_dev_id = rte_ml_dev_find_first_available();
-    if (ml_dev_id == RTE_ML_DEV_ID_INVALID)
-        rte_exit(EXIT_FAILURE, "No available ML device\n");
-
-    // Get device info
-    if (rte_ml_dev_info_get(ml_dev_id, &dev_info) < 0)
-        rte_exit(EXIT_FAILURE, "Failed to get ML device info\n");
-
-    // Configure device
-    dev_config.nb_models = 1;
-    dev_config.nb_queue_pairs = 1;
-    if (rte_ml_dev_configure(ml_dev_id, &dev_config) < 0)
-        rte_exit(EXIT_FAILURE, "Failed to configure ML device\n");
-
-    // Setup queue pair
-    if (rte_ml_dev_queue_pair_setup(ml_dev_id, 0, NULL) < 0)
-        rte_exit(EXIT_FAILURE, "Failed to setup ML queue pair\n");
-
-    // Load model
-    app_init_ml_model(ml_dev_id);
-
-	    // Get and validate model info
-    struct rte_ml_model_info model_info;
-    ret = rte_ml_model_info_get(ml_dev_id, MODEL_ID, &model_info);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Failed to get model info\n");
-
-    if (model_info.max_batch_size < MAX_BATCH_SIZE)
-        rte_exit(EXIT_FAILURE, "Model doesn't support required batch size\n");
-
-	// Start model
-    ret = rte_ml_model_start(ml_dev_id, MODEL_ID);
-    if (ret < 0)
-        rte_exit(EXIT_FAILURE, "Failed to start ML model\n");
-
-    // Start device
-    if (rte_ml_dev_start(ml_dev_id) < 0)
-        rte_exit(EXIT_FAILURE, "Failed to start ML device\n");
-}
 
 static void
 app_ports_check_link(void)
@@ -368,6 +299,52 @@ app_init_ports(void)
 	app_ports_check_link();
 }
 
+static void 
+app_init_flow_state(void)
+{
+    // ─── flow-state hash, only Core-0 writes ──────────────
+    flow_ht = rte_hash_create(&(struct rte_hash_parameters){
+        .name = "flow_ctx_ht",
+        .key_len = 20,                    // 5-tuple
+        .entries = 1 << 20,
+        .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY   // read-only from Core-1
+    });
+    if (!flow_ht)
+        rte_panic("Cannot create flow hash table\n");
+
+    ctx_mp  = rte_pktmbuf_pool_create("ctx_mp", 1<<20, 0, 0,
+                                      sizeof(struct flow_ctx), rte_socket_id());
+    if (!ctx_mp)
+        rte_panic("Cannot create flow_ctx mempool\n");
+
+    // ─── tiny mempool for ML messages (vectors) ───────────
+    vec_mp  = rte_pktmbuf_pool_create("vec_mp", 64*1024, 0, 0,
+                                      ML_VEC_DATA + RTE_PKTMBUF_HEADROOM,
+                                      rte_socket_id());
+    if (!vec_mp)
+        rte_panic("Cannot create ML vector mempool\n");
+
+    // ─── quarantine ring seen only by Core-1 ──────────────
+    quar_ring = rte_ring_create("quar", 1<<16, rte_socket_id(),
+                                RING_F_SP_ENQ | RING_F_SC_DEQ);   // single prod/cons
+    if (!quar_ring){
+		rte_panic("Cannot create quarantine ring\n");
+	}
+        
+
+	flow_pool = rte_zmalloc_socket("flow_pool",
+                                   (1<<20) * sizeof(struct flow_ctx *),
+                                   RTE_CACHE_LINE_SIZE,
+                                   rte_socket_id());
+    if (!flow_pool){
+        rte_panic("Cannot alloc flow_pool\n");
+    }
+}
+
+double tsc_to_sec  = 0.0;
+double tsc_to_usec = 0.0;
+
+
 void
 app_init(void)
 {
@@ -375,7 +352,16 @@ app_init(void)
 	app_init_rings();
 	app_init_ports();
 	app_init_ml_ring();
-	app_init_ml_device();
+	app_init_flow_state();
+	tsc_to_sec  = 1.0 / (double)rte_get_tsc_hz();
+    tsc_to_usec = tsc_to_sec * 1e6;
+
+
+	if (onnx_init(MODEL_PATH) != 0)
+    	rte_exit(EXIT_FAILURE, "Failed to initialize ONNX Runtime\n");
+
+
+
 
 	RTE_LOG(INFO, USER1, "Initialization completed\n");
 }
